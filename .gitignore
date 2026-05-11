@@ -1,0 +1,8 @@
+# 构建产物
+check-hermes-web-ui.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
