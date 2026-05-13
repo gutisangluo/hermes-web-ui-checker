@@ -1,3 +1,14 @@
+// check-hermes-web-ui v2 — Go cross-compiled Windows exe
+// 检测 14 项 + 自动修复 Hermes Web UI + 网关问题
+//
+// 编译：GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o check-hermes-web-ui.exe .
+// GitHub: https://github.com/gutisangluo/hermes-web-ui-checker
+//
+// v2 新增（2026-05-13）：
+// - 端口一致性检查：检测 GatewayManager 是否篡改 ports.api_server.extra.port
+// - SQLite 增强：检测 Web UI 进程挂起，自动删主 .db 文件重建
+// - 从 config.yaml 读取实际端口，不硬编码 8642
+
 package main
 
 import (
@@ -34,13 +45,13 @@ func main() {
 
 	check("1. Node.js 版本 >= 23", checkNodeVersion)
 	check("2. Hermes CLI 已安装", checkHermesCLI)
-	check("3. api_server 配置正确", checkAPIServerConfig)
-	check("4. GATEWAY_ALLOW_ALL_USERS", checkGateWayEnv)
-	check("5. active_profile 文件", checkActiveProfile)
-	check("6. SQLite 数据库清理", checkSQLite)
-	check("7. Login lock 清理", checkLoginLock)
-	check("8. 全局 config.yaml 格式", checkGlobalYAML)
-	check("9. 多余 default profile", checkDefaultProfile)
+	check("3. api_server 配置正确", checkAPIServerConfig, fixAPIServerConfig)
+	check("4. GATEWAY_ALLOW_ALL_USERS", checkGateWayEnv, fixGateWayEnv)
+	check("5. active_profile 文件", checkActiveProfile, fixActiveProfile)
+	check("6. SQLite 数据库清理", checkSQLite, fixSQLite)
+	check("7. Login lock 清理", checkLoginLock, fixLoginLock)
+	check("8. 全局 config.yaml 格式", checkGlobalYAML, fixGlobalYAML)
+	check("9. 多余 default profile", checkDefaultProfile, fixDefaultProfile)
 	check("10. Hermes 网关运行", checkGateway, fixGateway)
 	check("11. Web UI 运行", checkWebUI, fixWebUI)
 	check("12. 端口一致性检查", checkPortConsistency, fixPortConsistency)
@@ -52,8 +63,6 @@ func main() {
 		result.Passed, result.Failed, fixes, result.Total)
 
 	result.URL = "http://localhost:" + getActualPort()
-
-	// Try to get token
 	token := getToken()
 	if token != "" {
 		result.Token = fmt.Sprintf("http://localhost:%s/#/?token=%s", getActualPort(), token)
@@ -89,14 +98,12 @@ func check(name string, fn func() bool, fixFn ...func() bool) {
 	} else {
 		result.Failed++
 		fmt.Println("✗ 失败")
-		if len(fixFn) > 0 && hasFlag("-nofix") == false {
+		if len(fixFn) > 0 && !hasFlag("-nofix") {
 			fmt.Printf("    → 尝试修复... ")
 			if fixFn[0]() {
 				fixes++
 				fmt.Println("✓ 已修复")
 				result.Fixed++
-				result.Passed++
-				result.Failed--
 			} else {
 				fmt.Println("✗ 修复失败")
 			}
@@ -113,7 +120,7 @@ func hasFlag(name string) bool {
 	return false
 }
 
-// --- Checks ---
+// — Checks —
 
 func checkNodeVersion() bool {
 	out, err := wsl("node --version 2>/dev/null")
@@ -134,7 +141,6 @@ func checkHermesCLI() bool {
 }
 
 func checkAPIServerConfig() bool {
-	// Check that platforms.api_server section exists, enabled, port/host/key valid
 	py := `python3 -c "
 import yaml
 cfg = yaml.safe_load(open('/root/.hermes/profiles/deepseek/config.yaml'))
@@ -156,9 +162,8 @@ print(f'{port}|{host}|{key}')
 }
 
 func fixAPIServerConfig() bool {
-	// Ensure api_server config has correct structure
 	py := `python3 -c "
-import yaml, sys
+import yaml
 path = '/root/.hermes/profiles/deepseek/config.yaml'
 with open(path) as f:
     cfg = yaml.safe_load(f)
@@ -213,20 +218,16 @@ func fixActiveProfile() bool {
 }
 
 func checkSQLite() bool {
-	// Check for stale SHM/WAL files AND that main DB is not corrupted
 	hasSHM := wslExit0("test -f /root/.hermes-web-ui/hermes-web-ui.db-shm")
 	hasWAL := wslExit0("test -f /root/.hermes-web-ui/hermes-web-ui.db-wal")
 	if hasSHM || hasWAL {
 		return false
 	}
-	// Also check if main DB is too small (<1KB = empty/corrupted) while Web UI process exists
 	hasDB := wslExit0("test -f /root/.hermes-web-ui/hermes-web-ui.db")
-	webUIRunning := wslExit0("pgrep -f 'hermes-web-ui' >/dev/null 2>&1")
+	webUIRunning := wslExit0("pgrep -f 'hermes-web-ui/dist/server' >/dev/null 2>&1")
 	if hasDB && webUIRunning {
-		// Check if Web UI is actually listening (if not, DB might be corrupted)
 		listening := wslExit0("ss -tlnp 2>/dev/null | grep -q 8648")
 		if !listening {
-			// Web UI process running but not listening = DB corruption likely
 			return false
 		}
 	}
@@ -234,20 +235,14 @@ func checkSQLite() bool {
 }
 
 func fixSQLite() bool {
-	// Clean all SQLite residuals AND optionally delete main DB if Web UI is hung
 	wsl("rm -f /root/.hermes-web-ui/hermes-web-ui.db-shm /root/.hermes-web-ui/hermes-web-ui.db-wal")
-
-	// Check if Web UI process is running but not listening (hung state)
 	webUIProc := wslExit0("pgrep -f 'hermes-web-ui/dist/server' >/dev/null 2>&1")
 	listening := wslExit0("ss -tlnp 2>/dev/null | grep -q 8648")
-
 	if webUIProc && !listening {
-		// Process hung on DB init — kill it and delete DB
 		fmt.Print("(Web UI 进程挂起, 清理数据库...) ")
 		wsl("pkill -9 -f 'hermes-web-ui' 2>/dev/null; sleep 1; rm -f /root/.hermes-web-ui/hermes-web-ui.db")
 		return true
 	}
-
 	return !wslExit0("test -f /root/.hermes-web-ui/hermes-web-ui.db-shm") &&
 		!wslExit0("test -f /root/.hermes-web-ui/hermes-web-ui.db-wal")
 }
@@ -266,13 +261,11 @@ func checkGlobalYAML() bool {
 }
 
 func fixGlobalYAML() bool {
-	// Deduplicate known problematic keys
 	wsl(`python3 -c "
 import yaml, sys
 path = '/root/.hermes/config.yaml'
 with open(path) as f:
     data = f.read()
-# Remove duplicate plugins: line
 lines = data.split('\n')
 seen = {}
 new_lines = []
@@ -299,72 +292,69 @@ func fixDefaultProfile() bool {
 	return checkDefaultProfile()
 }
 
+func getActualPort() string {
+	out, err := wsl(`python3 -c "
+import yaml
+cfg = yaml.safe_load(open('/root/.hermes/profiles/deepseek/config.yaml'))
+print(cfg.get('platforms',{}).get('api_server',{}).get('extra',{}).get('port',8642))
+" 2>/dev/null`)
+	if err != nil {
+		return "8642"
+	}
+	return strings.TrimSpace(out)
+}
+
 func checkGateway() bool {
 	port := getActualPort()
 	return wslExit0(fmt.Sprintf("ss -tlnp 2>/dev/null | grep -q ':%s'", port))
 }
 
 func fixGateway() bool {
-	// Kill any existing gateway, clean locks, start new one
 	wsl(`pkill -9 -f "hermes.*gateway run" 2>/dev/null; sleep 1;
 rm -f /root/.hermes/gateway.lock /root/.hermes/profiles/deepseek/gateway.lock
 rm -f /root/.hermes/gateway_state.json /root/.hermes/profiles/deepseek/gateway_state.json
 rm -f /root/.hermes/gateway/gateway.pid /root/.hermes/profiles/deepseek/gateway.pid`)
-
+	// Start gateway with nohup, poll up to 40 seconds
 	port := getActualPort()
-
-	// Start gateway with nohup
 	_, err := wsl(fmt.Sprintf(`nohup hermes gateway run --replace --accept-hooks > /dev/null 2>&1 &
 disown
-sleep 5
-ss -tlnp 2>/dev/null | grep -q ':%s'`, port))
+for i in 1 2 3 4 5 6 7 8; do
+  ss -tlnp 2>/dev/null | grep -q ':%s' && break
+  sleep 5
+done
+ss -tlnp 2>/dev/null | grep -q ':%s'`, port, port))
 	return err == nil
 }
 
 func checkWebUI() bool {
-	port := getActualPort()
-	return wslExit0(fmt.Sprintf("ss -tlnp 2>/dev/null | grep -q ':%s'", port))
+	// Web UI 始终在 8648，不受 api_server 端口影响
+	return wslExit0("ss -tlnp 2>/dev/null | grep -q ':8648'")
 }
 
 func fixWebUI() bool {
-	// Kill existing Web UI, clean residuals, restart
 	wsl(`pkill -9 -f "hermes-web-ui" 2>/dev/null; sleep 1;
 rm -f /root/.hermes-web-ui/server.pid
 rm -f /root/.hermes-web-ui/hermes-web-ui.db-shm /root/.hermes-web-ui/hermes-web-ui.db-wal`)
-
-	// Check if DB is corrupted by seeing if Web UI was hung previously
 	listening := wslExit0("ss -tlnp 2>/dev/null | grep -q 8648")
 	if !listening {
-		// Delete main DB too (session loss acceptable for recovery)
 		wsl("rm -f /root/.hermes-web-ui/hermes-web-ui.db")
 	}
-
 	_, err := wsl(`nohup env HOME=/root hermes-web-ui start 8648 > /root/.hermes-web-ui/server.log 2>&1 &
 disown
-sleep 8
+for i in 1 2 3 4 5 6 7 8; do
+  ss -tlnp 2>/dev/null | grep -q ':8648' && break
+  sleep 5
+done
 ss -tlnp 2>/dev/null | grep -q ':8648'`)
 	return err == nil
 }
 
-// New check: port consistency — GatewayManager sometimes changes the port
 func checkPortConsistency() bool {
-	pyPort := `python3 -c "
-import yaml
-cfg = yaml.safe_load(open('/root/.hermes/profiles/deepseek/config.yaml'))
-p = cfg.get('platforms',{}).get('api_server',{}).get('extra',{}).get('port',8642)
-print(p)
-" 2>/dev/null`
-	out, err := wsl(pyPort)
-	if err != nil {
-		return false
-	}
-	configPort := strings.TrimSpace(out)
-	expectedPort := "8642"
-	return configPort == expectedPort
+	configPort := getActualPort()
+	return configPort == "8642"
 }
 
 func fixPortConsistency() bool {
-	// Fix port back to 8642
 	_, err := wsl(`python3 -c "
 import yaml
 path = '/root/.hermes/profiles/deepseek/config.yaml'
@@ -398,20 +388,6 @@ func checkAccessInfo() bool {
 		return false
 	}
 	return out == "200"
-}
-
-// --- Helpers ---
-
-func getActualPort() string {
-	out, err := wsl(`python3 -c "
-import yaml
-cfg = yaml.safe_load(open('/root/.hermes/profiles/deepseek/config.yaml'))
-print(cfg.get('platforms',{}).get('api_server',{}).get('extra',{}).get('port',8642))
-" 2>/dev/null`)
-	if err != nil {
-		return "8642"
-	}
-	return strings.TrimSpace(out)
 }
 
 func getToken() string {
